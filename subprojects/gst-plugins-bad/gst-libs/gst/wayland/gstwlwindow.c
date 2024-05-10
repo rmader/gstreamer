@@ -26,6 +26,8 @@
 
 #include "gstwlwindow.h"
 
+#include "color-management-v1-client-protocol.h"
+#include "color-representation-v1-client-protocol.h"
 #include "fullscreen-shell-unstable-v1-client-protocol.h"
 #include "single-pixel-buffer-v1-client-protocol.h"
 #include "viewporter-client-protocol.h"
@@ -51,6 +53,8 @@ typedef struct _GstWlWindowPrivate
   struct wp_viewport *video_viewport;
   struct xdg_surface *xdg_surface;
   struct xdg_toplevel *xdg_toplevel;
+  struct wp_color_management_surface_v1 *color_management_surface;
+  struct wp_color_representation_surface_v1 *color_representation_surface;
   gboolean configured;
   GCond configure_cond;
   GMutex configure_mutex;
@@ -103,6 +107,9 @@ static void gst_wl_window_update_borders (GstWlWindow * self);
 
 static void gst_wl_window_commit_buffer (GstWlWindow * self,
     GstWlBuffer * buffer);
+
+static void gst_wl_window_set_colorimetry (GstWlWindow * self,
+    GstVideoColorimetry * colorimetry);
 
 static void
 handle_xdg_toplevel_close (void *data, struct xdg_toplevel *xdg_toplevel)
@@ -209,6 +216,13 @@ gst_wl_window_finalize (GObject * gobject)
 
   if (priv->video_viewport)
     wp_viewport_destroy (priv->video_viewport);
+
+  if (priv->color_management_surface)
+    wp_color_management_surface_v1_destroy (priv->color_management_surface);
+
+  if (priv->color_representation_surface)
+    wp_color_representation_surface_v1_destroy
+        (priv->color_representation_surface);
 
   wl_proxy_wrapper_destroy (priv->video_surface_wrapper);
   wl_subsurface_destroy (priv->video_subsurface);
@@ -574,6 +588,8 @@ gst_wl_window_commit_buffer (GstWlWindow * self, GstWlBuffer * buffer)
     wl_subsurface_set_sync (priv->video_subsurface);
     gst_wl_window_resize_video_surface (self, FALSE);
     gst_wl_window_set_opaque (self, info);
+
+    gst_wl_window_set_colorimetry (self, &info->colorimetry);
   }
 
   if (G_LIKELY (buffer)) {
@@ -829,4 +845,217 @@ gst_wl_window_set_rotate_method (GstWlWindow * self,
   priv->buffer_transform = output_transform_from_orientation_method (method);
 
   gst_wl_window_update_geometry (self);
+}
+
+typedef struct
+{
+  gboolean ready;
+  gboolean failed;
+} ImageDescriptionFeedback;
+
+static void
+image_description_failed (void *data,
+    struct wp_image_description_v1 *wp_image_description_v1, uint32_t cause,
+    const char *msg)
+{
+  ImageDescriptionFeedback *image_description_feedback = data;
+
+  image_description_feedback->failed = TRUE;
+}
+
+static void
+image_description_ready (void *data,
+    struct wp_image_description_v1 *wp_image_description_v1, uint32_t identity)
+{
+  ImageDescriptionFeedback *image_description_feedback = data;
+
+  image_description_feedback->ready = TRUE;
+}
+
+static const struct wp_image_description_v1_listener description_listerer = {
+  .failed = image_description_failed,
+  .ready = image_description_ready,
+};
+
+static void
+gst_wl_window_set_colorimetry (GstWlWindow * self,
+    GstVideoColorimetry * colorimetry)
+{
+  GstWlWindowPrivate *priv = gst_wl_window_get_instance_private (self);
+  struct wl_display *wl_display;
+  struct wp_color_manager_v1 *color_manager;
+  struct wp_color_representation_manager_v1 *cr_manager;
+
+  wl_display = gst_wl_display_get_display (priv->display);
+
+  GST_INFO_OBJECT (self, "Trying to set colorimetry: %s",
+      gst_video_colorimetry_to_string (colorimetry));
+
+  color_manager = gst_wl_display_get_color_manager_v1 (priv->display);
+  if (color_manager &&
+      gst_wl_display_get_color_parametric_creator_supported (priv->display)) {
+    uint32_t wl_transfer_function = 0;
+    uint32_t wl_primaries = 0;
+
+    switch (colorimetry->transfer) {
+      case GST_VIDEO_TRANSFER_SRGB:
+        wl_transfer_function = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB;
+        break;
+      case GST_VIDEO_TRANSFER_BT601:
+      case GST_VIDEO_TRANSFER_BT709:
+      case GST_VIDEO_TRANSFER_BT2020_10:
+        wl_transfer_function = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_BT1886;
+        break;
+      case GST_VIDEO_TRANSFER_SMPTE2084:
+        wl_transfer_function = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ;
+        break;
+      case GST_VIDEO_TRANSFER_ARIB_STD_B67:
+        wl_transfer_function = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_HLG;
+        break;
+      default:
+        break;
+    }
+
+    switch (colorimetry->primaries) {
+      case GST_VIDEO_COLOR_PRIMARIES_BT709:
+        wl_primaries = WP_COLOR_MANAGER_V1_PRIMARIES_SRGB;
+        break;
+      case GST_VIDEO_COLOR_PRIMARIES_SMPTE170M:
+        wl_primaries = WP_COLOR_MANAGER_V1_PRIMARIES_NTSC;
+        break;
+      case GST_VIDEO_COLOR_PRIMARIES_BT2020:
+        wl_primaries = WP_COLOR_MANAGER_V1_PRIMARIES_BT2020;
+        break;
+      default:
+        break;
+    }
+
+    if (gst_wl_display_get_color_transfer_function_supported (priv->display,
+            wl_transfer_function) &&
+        gst_wl_display_get_color_primaries_supported (priv->display,
+            wl_primaries)) {
+      struct wp_color_manager_v1 *color_manager_wrapper = NULL;
+      struct wl_event_queue *color_manager_queue = NULL;
+      struct wp_image_description_v1 *image_description = NULL;
+      struct wp_image_description_creator_params_v1 *params;
+      ImageDescriptionFeedback image_description_feedback = { 0 };
+
+      color_manager_wrapper = wl_proxy_create_wrapper (color_manager);
+      color_manager_queue = wl_display_create_queue (wl_display);
+      wl_proxy_set_queue ((struct wl_proxy *) color_manager_wrapper,
+          color_manager_queue);
+
+      params =
+          wp_color_manager_v1_create_parametric_creator (color_manager_wrapper);
+
+      wp_image_description_creator_params_v1_set_tf_named (params,
+          wl_transfer_function);
+      wp_image_description_creator_params_v1_set_primaries_named (params,
+          wl_primaries);
+
+      image_description =
+          wp_image_description_creator_params_v1_create (params);
+      wp_image_description_v1_add_listener (image_description,
+          &description_listerer, &image_description_feedback);
+
+      while (!image_description_feedback.ready &&
+          !image_description_feedback.failed) {
+        if (wl_display_dispatch_queue (wl_display, color_manager_queue) == -1)
+          break;
+      }
+
+      if (image_description_feedback.ready) {
+        if (!priv->color_management_surface) {
+          priv->color_management_surface =
+              wp_color_manager_v1_get_surface (color_manager,
+              priv->video_surface_wrapper);
+        }
+
+        wp_color_management_surface_v1_set_image_description
+            (priv->color_management_surface, image_description,
+            WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
+
+        GST_INFO_OBJECT (self, "Successfully set parametric image description");
+      } else {
+        GST_INFO_OBJECT (self, "Creating image description failed");
+      }
+
+      /* Setting the image description has copy semantics */
+      wp_image_description_v1_destroy (image_description);
+      wl_proxy_wrapper_destroy (color_manager_wrapper);
+      wl_event_queue_destroy (color_manager_queue);
+    } else {
+      if (priv->color_management_surface) {
+        wp_color_management_surface_v1_destroy (priv->color_management_surface);
+        priv->color_management_surface = NULL;
+      }
+
+      GST_INFO_OBJECT (self,
+          "Can not create image description: primaries or transfer function not supported");
+    }
+  } else {
+    GST_INFO_OBJECT (self,
+        "Color management or parametric creator not supported");
+  }
+
+  cr_manager =
+      gst_wl_display_get_color_representation_manager_v1 (priv->display);
+  if (cr_manager) {
+    uint32_t wl_coefficients = 0;
+    uint32_t wl_range = 0;
+
+    switch (colorimetry->matrix) {
+      case GST_VIDEO_COLOR_MATRIX_RGB:
+        wl_coefficients =
+            WP_COLOR_REPRESENTATION_SURFACE_V1_COEFFICIENTS_IDENTITY;
+        break;
+      case GST_VIDEO_COLOR_MATRIX_BT709:
+        wl_coefficients = WP_COLOR_REPRESENTATION_SURFACE_V1_COEFFICIENTS_BT709;
+        break;
+      case GST_VIDEO_COLOR_MATRIX_BT601:
+        wl_coefficients = WP_COLOR_REPRESENTATION_SURFACE_V1_COEFFICIENTS_BT601;
+        break;
+      case GST_VIDEO_COLOR_MATRIX_BT2020:
+        wl_coefficients =
+            WP_COLOR_REPRESENTATION_SURFACE_V1_COEFFICIENTS_BT2020;
+        break;
+      default:
+        break;
+    }
+
+    switch (colorimetry->range) {
+      case GST_VIDEO_COLOR_RANGE_0_255:
+        wl_range = WP_COLOR_REPRESENTATION_SURFACE_V1_RANGE_FULL;
+        break;
+      case GST_VIDEO_COLOR_RANGE_16_235:
+        wl_range = WP_COLOR_REPRESENTATION_SURFACE_V1_RANGE_LIMITED;
+        break;
+      default:
+        break;
+    }
+
+    if (gst_wl_display_get_color_coefficients_supported (priv->display,
+            wl_coefficients, wl_range)) {
+      if (!priv->color_representation_surface) {
+        priv->color_representation_surface =
+            wp_color_representation_manager_v1_get_surface (cr_manager,
+            priv->video_surface_wrapper);
+      }
+
+      wp_color_representation_surface_v1_set_coefficients_and_range
+          (priv->color_representation_surface, wl_coefficients, wl_range);
+
+      GST_INFO_OBJECT (self, "Successfully set color representation");
+    } else {
+      if (priv->color_representation_surface) {
+        wp_color_representation_surface_v1_destroy
+            (priv->color_representation_surface);
+        priv->color_representation_surface = NULL;
+      }
+
+      GST_INFO_OBJECT (self, "Coefficients and range not supported");
+    }
+  } else {
+    GST_INFO_OBJECT (self, "Color representation not supported");
+  }
 }
