@@ -50,7 +50,7 @@ struct _GstJifMux {
   /* list of GstJifMuxMarker */
   GList *markers;
   guint scan_size;
-  const guint8 *scan_data;
+  guint8 *scan_data;
 };
 
 struct _GstJifMuxClass {

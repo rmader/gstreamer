@@ -92,7 +92,7 @@ typedef struct _GstJifMuxMarker
   guint8 marker;
   guint16 size;
 
-  const guint8 *data;
+  guint8 *data;
   gboolean owned;
 } GstJifMuxMarker;
 
@@ -250,7 +250,8 @@ gst_jif_mux_new_marker (guint8 marker, guint16 size, const guint8 * data,
 
   m->marker = marker;
   m->size = size;
-  m->data = data;
+  m->data = g_malloc (size);
+  memcpy (m->data, data, size);
   m->owned = owned;
 
   return m;
@@ -333,9 +334,10 @@ gst_jif_mux_parse_image (GstJifMux * self, GstBuffer * buf)
 
       /* remaining size except EOI is scan data */
       self->scan_size = eoi_pos - gst_byte_reader_get_pos (&reader);
-      if (!gst_byte_reader_get_data (&reader, self->scan_size,
-              &self->scan_data))
+      if (!gst_byte_reader_get_data (&reader, self->scan_size, &data))
         goto error;
+      self->scan_data = g_malloc (self->scan_size);
+      memcpy (self->scan_data, data, self->scan_size);
 
       GST_DEBUG_OBJECT (self, "scan data, size = %u", self->scan_size);
     }
@@ -687,6 +689,8 @@ gst_jif_mux_recombine_image (GstJifMux * self, GstBuffer ** new_buf,
   }
   gst_buffer_unmap (buf, &map);
   gst_byte_writer_free (writer);
+  g_free (self->scan_data);
+  self->scan_data = NULL;
 
   if (!writer_status) {
     GST_WARNING_OBJECT (self, "Failed to write to buffer, calculated size "
