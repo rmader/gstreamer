@@ -3267,6 +3267,14 @@ exit:
   demux->segment_seqnum = seqnum;
   GST_OBJECT_UNLOCK (demux);
 
+  for (int i = 0; i < demux->common.src->len; i++) {
+    GstMatroskaTrackContext *stream;
+
+    stream = g_ptr_array_index (demux->common.src, i);
+    stream->tags_changed = TRUE;
+  }
+  gst_matroska_demux_send_tags (demux);
+
   /* restart our task since it might have been stopped when we did the
    * flush. */
   gst_pad_start_task (demux->common.sinkpad,
