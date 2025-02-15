@@ -42,6 +42,7 @@ if use_wayland
     ['xdg-shell', 'stable', ],
     ['single-pixel-buffer', 'staging', 'v1' ],
     ['color-management-v1', 'internal' ],
+    ['color-representation-v1', 'internal' ],
   ]
   protocols_files = []
 
