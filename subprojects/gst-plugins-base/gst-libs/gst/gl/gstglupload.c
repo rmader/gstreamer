@@ -39,6 +39,7 @@
 
 #if GST_GL_HAVE_DMABUF
 #include <gst/allocators/gstdmabuf.h>
+#include <gst/allocators/gstudmabufallocator.h>
 #ifdef HAVE_LIBDRM
 #include <drm_fourcc.h>
 #endif
@@ -396,6 +397,416 @@ static const UploadMethod _passthrough_upload = {
   &_passthrough_upload_perform,
   &_passthrough_upload_free
 };
+
+#if GST_GL_HAVE_DMABUF
+
+struct UdmabufUpload
+{
+  GstGLUpload *upload;
+
+  GstAllocator *allocator;
+  GstBufferPool *pool;
+  GstCaps *in_caps;
+  GstCaps *out_caps;
+};
+
+#define UDMABUF_ALIGNMENT_MASK 256 - 1
+
+static void
+_udmabuf_reset (struct UdmabufUpload *upload)
+{
+  g_clear_object (&upload->pool);
+  g_clear_pointer (&upload->in_caps, gst_caps_unref);
+  g_clear_pointer (&upload->out_caps, gst_caps_unref);
+}
+
+static gpointer
+_udmabuf_upload_new (GstGLUpload * upload)
+{
+  struct UdmabufUpload *udmabuf = g_new0 (struct UdmabufUpload, 1);
+
+  gst_udmabuf_allocator_init_once ();
+
+  udmabuf->upload = upload;
+  udmabuf->allocator = gst_allocator_find (GST_ALLOCATOR_UDMABUF);
+
+  return udmabuf;
+}
+
+#define UDMABUF_SINK_CAPS_MAKE                                                 \
+    GST_VIDEO_CAPS_MAKE ("{ NV12, P010, I420, Y42B, Y444 }")
+
+#define UDMABUF_SRC_CAPS_MAKE                                                  \
+    GST_VIDEO_DMA_DRM_CAPS_MAKE                                                \
+    ", drm-format = (string) { NV12, P010, YU12, YU16, YU24 }, "
+
+static GstStaticCaps _udmabuf_upload_sink_caps =
+GST_STATIC_CAPS (UDMABUF_SINK_CAPS_MAKE);
+
+static GstStaticCaps _udmabuf_upload_src_caps =
+GST_STATIC_CAPS (UDMABUF_SRC_CAPS_MAKE);
+
+static GstCaps *
+_udmabuf_upload_transform_caps (gpointer impl, GstGLContext * context,
+    GstPadDirection direction, GstCaps * caps)
+{
+  struct UdmabufUpload *upload = impl;
+  GstCaps *out_caps;
+
+  if (!upload->allocator)
+    return NULL;
+
+  if (direction == GST_PAD_SINK) {
+    g_autoptr (GstCaps) static_caps;
+    g_autoptr (GstCaps) intersected_caps;
+    GstCapsFeatures *features;
+
+    static_caps = gst_static_caps_get (&_udmabuf_upload_sink_caps);
+    intersected_caps = gst_caps_intersect_full (caps, static_caps,
+        GST_CAPS_INTERSECT_FIRST);
+    out_caps = gst_caps_new_empty ();
+
+    if (gst_caps_is_empty (intersected_caps))
+      return out_caps;
+
+    features =
+        gst_caps_features_new_static_str (GST_CAPS_FEATURE_MEMORY_DMABUF, NULL);
+
+    for (gint i = 0; i < gst_caps_get_size (intersected_caps); i++) {
+      GstStructure *structure;
+      const GValue *val;
+      GPtrArray *all_drm_formats = NULL;
+      GValue drm_formats = G_VALUE_INIT;
+
+      structure = gst_caps_get_structure (intersected_caps, i);
+
+      if (!(val = gst_structure_get_value (structure, "format")))
+        continue;
+
+      all_drm_formats = g_ptr_array_new ();
+
+      if (G_VALUE_HOLDS_STRING (val)) {
+        GstVideoFormat gst_format;
+        guint32 fourcc;
+
+        gst_format = gst_video_format_from_string (g_value_get_string (val));
+        fourcc = gst_video_dma_drm_fourcc_from_format (gst_format);
+        if (fourcc != DRM_FORMAT_INVALID) {
+          char *drm_format;
+
+          drm_format = gst_video_dma_drm_fourcc_to_string (fourcc, 0);
+          g_ptr_array_add (all_drm_formats, drm_format);
+        }
+      } else if (GST_VALUE_HOLDS_LIST (val)) {
+        for (gint j = 0; j < gst_value_list_get_size (val); j++) {
+          const GValue *fmt_val = gst_value_list_get_value (val, j);
+          GstVideoFormat gst_format;
+          guint32 fourcc;
+
+          gst_format =
+              gst_video_format_from_string (g_value_get_string (fmt_val));
+          fourcc = gst_video_dma_drm_fourcc_from_format (gst_format);
+          if (fourcc != DRM_FORMAT_INVALID) {
+            char *drm_format;
+
+            drm_format = gst_video_dma_drm_fourcc_to_string (fourcc, 0);
+            g_ptr_array_add (all_drm_formats, drm_format);
+          }
+        }
+      }
+
+      if (all_drm_formats->len == 0) {
+        g_ptr_array_unref (all_drm_formats);
+        continue;
+      }
+
+      if (all_drm_formats->len == 1) {
+        g_value_init (&drm_formats, G_TYPE_STRING);
+        g_value_take_string (&drm_formats, g_ptr_array_index (all_drm_formats,
+                0));
+      } else {
+        gst_value_list_init (&drm_formats, all_drm_formats->len);
+
+        for (i = 0; i < all_drm_formats->len; i++) {
+          GValue item = G_VALUE_INIT;
+
+          g_value_init (&item, G_TYPE_STRING);
+          g_value_take_string (&item, g_ptr_array_index (all_drm_formats, i));
+          gst_value_list_append_value (&drm_formats, &item);
+        }
+      }
+      g_ptr_array_unref (all_drm_formats);
+
+      structure = gst_structure_copy (structure);
+      gst_structure_set (structure, "format", G_TYPE_STRING, "DMA_DRM", NULL);
+      gst_structure_take_value (structure, "drm-format", &drm_formats);
+
+      gst_caps_append_structure_full (out_caps, structure,
+          gst_caps_features_copy (features));
+    }
+
+    gst_caps_features_free (features);
+  } else {
+    g_autoptr (GstCaps) static_caps;
+    g_autoptr (GstCaps) intersected_caps;
+    GstCapsFeatures *features;
+
+    static_caps = gst_static_caps_get (&_udmabuf_upload_src_caps);
+    intersected_caps = gst_caps_intersect_full (caps, static_caps,
+        GST_CAPS_INTERSECT_FIRST);
+    out_caps = gst_caps_new_empty ();
+
+    if (gst_caps_is_empty (intersected_caps))
+      return out_caps;
+
+    features =
+        gst_caps_features_new_static_str (GST_CAPS_FEATURE_MEMORY_SYSTEM_MEMORY,
+        NULL);
+
+    for (gint i = 0; i < gst_caps_get_size (intersected_caps); i++) {
+      GstStructure *structure;
+      const GValue *val;
+      GArray *all_gst_formats = NULL;
+      GValue gst_formats = G_VALUE_INIT;
+
+      structure = gst_caps_get_structure (intersected_caps, i);
+
+      if (!(val = gst_structure_get_value (structure, "drm-format")))
+        continue;
+
+      all_gst_formats = g_array_new (FALSE, FALSE, sizeof (GstVideoFormat));
+
+      if (G_VALUE_HOLDS_STRING (val)) {
+        GstVideoFormat gst_format;
+        guint32 fourcc;
+        guint64 modifier;
+
+        fourcc =
+            gst_video_dma_drm_fourcc_from_string (g_value_get_string (val),
+            &modifier);
+        gst_format = gst_video_dma_drm_format_to_gst_format (fourcc, modifier);
+        if (gst_format != GST_VIDEO_FORMAT_UNKNOWN
+            && modifier == DRM_FORMAT_MOD_LINEAR)
+          g_array_append_val (all_gst_formats, gst_format);
+      } else if (GST_VALUE_HOLDS_LIST (val)) {
+        for (gint j = 0; j < gst_value_list_get_size (val); j++) {
+          const GValue *fmt_val = gst_value_list_get_value (val, j);
+          GstVideoFormat gst_format;
+          guint32 fourcc;
+          guint64 modifier;
+
+          fourcc =
+              gst_video_dma_drm_fourcc_from_string (g_value_get_string
+              (fmt_val), &modifier);
+          gst_format =
+              gst_video_dma_drm_format_to_gst_format (fourcc, modifier);
+          if (gst_format != GST_VIDEO_FORMAT_UNKNOWN
+              && modifier == DRM_FORMAT_MOD_LINEAR)
+            g_array_append_val (all_gst_formats, gst_format);
+        }
+      }
+
+      if (all_gst_formats->len == 0) {
+        g_array_unref (all_gst_formats);
+        continue;
+      }
+
+      if (all_gst_formats->len == 1) {
+        GstVideoFormat gst_format;
+
+        g_value_init (&gst_formats, G_TYPE_STRING);
+        gst_format = g_array_index (all_gst_formats, GstVideoFormat, 0);
+        g_value_set_string (&gst_formats,
+            gst_video_format_to_string (gst_format));
+      } else {
+        gst_value_list_init (&gst_formats, all_gst_formats->len);
+
+        for (gint j = 0; j < all_gst_formats->len; j++) {
+          GValue item = G_VALUE_INIT;
+          GstVideoFormat gst_format;
+
+          g_value_init (&item, G_TYPE_STRING);
+          gst_format = g_array_index (all_gst_formats, GstVideoFormat, j);
+          g_value_set_string (&item, gst_video_format_to_string (gst_format));
+          gst_value_list_append_value (&gst_formats, &item);
+        }
+      }
+      g_array_unref (all_gst_formats);
+
+      structure = gst_structure_copy (structure);
+      gst_structure_take_value (structure, "format", &gst_formats);
+      gst_structure_remove_field (structure, "drm-format");
+
+      gst_caps_append_structure_full (out_caps, structure,
+          gst_caps_features_copy (features));
+    }
+
+    gst_caps_features_free (features);
+  }
+
+  GST_DEBUG_OBJECT (upload->upload, "direction %s, transformed %"
+      GST_PTR_FORMAT " into %" GST_PTR_FORMAT,
+      direction == GST_PAD_SRC ? "src" : "sink", caps, out_caps);
+
+  return out_caps;
+}
+
+static gboolean
+_udmabuf_upload_accept (gpointer impl, GstBuffer * buffer,
+    GstCaps * in_caps, GstCaps * out_caps)
+{
+  struct UdmabufUpload *upload = impl;
+  g_autoptr (GstCaps) static_sink_caps = NULL;
+  g_autoptr (GstCaps) static_src_caps = NULL;
+  g_autoptr (GstCaps) common_in_caps = NULL;
+  g_autoptr (GstCaps) common_out_caps = NULL;
+
+  if (!upload->allocator || !upload->pool || upload->pool != buffer->pool)
+    return FALSE;
+
+  if (upload->in_caps && upload->out_caps &&
+      gst_caps_is_equal (upload->in_caps, in_caps) &&
+      gst_caps_is_equal (upload->out_caps, out_caps))
+    return TRUE;
+
+  static_sink_caps = gst_static_caps_get (&_udmabuf_upload_sink_caps);
+  common_in_caps = gst_caps_intersect_full (in_caps, static_sink_caps,
+      GST_CAPS_INTERSECT_FIRST);
+  if (gst_caps_is_empty (common_in_caps)) {
+    GST_DEBUG_OBJECT (upload->upload, "No common caps, direction sink");
+    return FALSE;
+  }
+
+  static_src_caps = gst_static_caps_get (&_udmabuf_upload_src_caps);
+  common_out_caps = gst_caps_intersect_full (out_caps, static_src_caps,
+      GST_CAPS_INTERSECT_FIRST);
+  if (gst_caps_is_empty (common_out_caps)) {
+    GST_DEBUG_OBJECT (upload->upload, "No common caps, direction sink");
+    return FALSE;
+  }
+
+  GST_DEBUG_OBJECT (upload->upload, "New caps in: %" GST_PTR_FORMAT " out: %"
+      GST_PTR_FORMAT, in_caps, out_caps);
+
+  upload->in_caps = gst_caps_copy (in_caps);
+  upload->out_caps = gst_caps_copy (out_caps);
+
+  return TRUE;
+}
+
+static void
+_udmabuf_upload_propose_allocation (gpointer impl, GstQuery * decide_query,
+    GstQuery * query)
+{
+  struct UdmabufUpload *upload = impl;
+  GstAllocationParams params = { 0, UDMABUF_ALIGNMENT_MASK, 0, 0, };
+  GstVideoAlignment video_align = { 0 };
+  g_autoptr (GstCaps) static_sink_caps = NULL;
+  g_autoptr (GstCaps) common_in_caps = NULL;
+  g_autoptr (GstCaps) query_caps = NULL;
+  gboolean need_pool;
+  GstVideoInfo info;
+  GstStructure *config;
+  gsize size;
+
+  if (!upload->allocator)
+    return;
+
+  if (upload->pool)
+    _udmabuf_reset (upload);
+
+  gst_query_parse_allocation (query, &query_caps, &need_pool);
+  if (!query_caps) {
+    GST_WARNING_OBJECT (upload->upload, "Query contained invalid caps");
+    return;
+  }
+
+  if (!need_pool) {
+    GST_DEBUG_OBJECT (upload->upload,
+        "Upstream element doesn't support downstream pools");
+    return;
+  }
+
+  static_sink_caps = gst_static_caps_get (&_udmabuf_upload_sink_caps);
+  common_in_caps = gst_caps_intersect_full (query_caps, static_sink_caps,
+      GST_CAPS_INTERSECT_FIRST);
+  if (gst_caps_is_empty (common_in_caps)) {
+    GST_DEBUG_OBJECT (upload->upload, "Caps not supported");
+    return;
+  }
+
+  if (!gst_video_info_from_caps (&info, query_caps)) {
+    GST_WARNING_OBJECT (upload->upload, "Can't create video info from caps");
+    return;
+  }
+
+  gst_query_add_allocation_param (query, upload->allocator, &params);
+  gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, 0);
+
+  upload->pool = gst_video_buffer_pool_new ();
+  config = gst_buffer_pool_get_config (upload->pool);
+
+  gst_buffer_pool_config_set_allocator (config, upload->allocator, &params);
+  size = GST_VIDEO_INFO_SIZE (&info);
+  gst_buffer_pool_config_set_params (config, gst_caps_ref (query_caps), size, 0,
+      0);
+  gst_buffer_pool_config_add_option (config, GST_BUFFER_POOL_OPTION_VIDEO_META);
+  gst_buffer_pool_config_add_option (config,
+      GST_BUFFER_POOL_OPTION_VIDEO_ALIGNMENT);
+
+  for (int i = 0; i != GST_VIDEO_MAX_PLANES; ++i)
+    video_align.stride_align[i] = UDMABUF_ALIGNMENT_MASK;
+  gst_buffer_pool_config_set_video_alignment (config, &video_align);
+
+  if (!gst_buffer_pool_set_config (upload->pool, config)) {
+    GST_WARNING_OBJECT (upload->upload, "Can't set pool config");
+    _udmabuf_reset (upload);
+    return;
+  }
+
+  gst_query_add_allocation_pool (query, upload->pool, size, 0, 0);
+
+  GST_INFO_OBJECT (upload->upload,
+      "Proposed udmabuf pool for caps: %" GST_PTR_FORMAT, query_caps);
+}
+
+static GstGLUploadReturn
+_udmabuf_upload_perform (gpointer impl, GstBuffer * buffer, GstBuffer ** outbuf)
+{
+  struct UdmabufUpload *upload = impl;
+
+  g_assert (upload->allocator);
+  g_assert (upload->pool);
+  g_assert (upload->pool == buffer->pool);
+
+  *outbuf = gst_buffer_ref (buffer);
+  GST_DEBUG_OBJECT (upload->upload, "Pass through udmabuf pool buffer %p",
+      buffer);
+  return GST_GL_UPLOAD_DONE;
+}
+
+static void
+_udmabuf_upload_free (gpointer impl)
+{
+  struct UdmabufUpload *upload = impl;
+
+  _udmabuf_reset (upload);
+  g_free (upload);
+}
+
+static const UploadMethod _udmabuf_upload = {
+  "Udmabuf uploader",
+  0,
+  &_udmabuf_upload_sink_caps,
+  &_udmabuf_upload_new,
+  &_udmabuf_upload_transform_caps,
+  &_udmabuf_upload_accept,
+  &_udmabuf_upload_propose_allocation,
+  &_udmabuf_upload_perform,
+  &_udmabuf_upload_free
+};
+
+#endif /* GST_GL_HAVE_DMABUF */
 
 struct GLMemoryUpload
 {
@@ -2948,6 +3359,9 @@ static const UploadMethod _nvmm_upload = {
 
 static const UploadMethod *upload_methods[] = {
   &_passthrough_upload,
+#if GST_GL_HAVE_DMABUF
+  &_udmabuf_upload,
+#endif /* GST_GL_HAVE_DMABUF */
   &_gl_memory_upload,
 #if GST_GL_HAVE_DMABUF
   &_direct_dma_buf_upload,
