@@ -434,11 +434,11 @@ _udmabuf_upload_new (GstGLUpload * upload)
 }
 
 #define UDMABUF_SINK_CAPS_MAKE                                                 \
-    GST_VIDEO_CAPS_MAKE ("{ NV12, P010, I420, Y42B, Y444 }")
+    GST_VIDEO_CAPS_MAKE ("{ NV12, P010, I420, Y42B, Y444, I420_10LE, I422_10LE, Y444_10LE, I420_12LE, I422_12LE, Y444_12LE }")
 
 #define UDMABUF_SRC_CAPS_MAKE                                                  \
     GST_VIDEO_DMA_DRM_CAPS_MAKE                                                \
-    ", drm-format = (string) { NV12, P010, YU12, YU16, YU24 }, "
+    ", drm-format = (string) { NV12, P010, YU12, YU16, YU24, I010, I210, I410, I012, I212, I412 }, "
 
 static GstStaticCaps _udmabuf_upload_sink_caps =
 GST_STATIC_CAPS (UDMABUF_SINK_CAPS_MAKE);
