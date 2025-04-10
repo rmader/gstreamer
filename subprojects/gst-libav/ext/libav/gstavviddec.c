@@ -1105,7 +1105,8 @@ gst_ffmpegviddec_get_buffer2 (AVCodecContext * context, AVFrame * picture,
        * https://bugzilla.gnome.org/show_bug.cgi?id=704769
        * https://bugzilla.libav.org/show_bug.cgi?id=556
        */
-      g_assert (picture->linesize[c] == ffmpegdec->stride[c]);
+      //g_assert (picture->linesize[c] == ffmpegdec->stride[c]);
+      ffmpegdec->stride[c] = picture->linesize[c];
     } else {
       picture->data[c] = NULL;
       picture->linesize[c] = 0;
@@ -2575,6 +2576,8 @@ gst_ffmpegviddec_decide_allocation (GstVideoDecoder * decoder, GstQuery * query)
         }
 
         gst_buffer_unref (tmp);
+
+        same_stride = TRUE;
 
         if (same_stride) {
           if (ffmpegdec->internal_pool)
