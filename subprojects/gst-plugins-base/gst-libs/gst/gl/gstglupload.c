@@ -743,7 +743,7 @@ _udmabuf_upload_propose_allocation (gpointer impl, GstQuery * decide_query,
   gst_query_add_allocation_param (query, upload->allocator, &params);
   gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, 0);
 
-  upload->pool = gst_video_buffer_pool_new ();
+  upload->pool = gst_udmabuf_video_pool_new ();
   config = gst_buffer_pool_get_config (upload->pool);
 
   gst_buffer_pool_config_set_allocator (config, upload->allocator, &params);
