@@ -59,7 +59,7 @@ gstallocators = library('gstallocators-@0@'.format(api_version),
   soversion : soversion,
   darwin_versions : osxversion,
   install : true,
-  dependencies : [libdrm_dep, gst_dep],
+  dependencies : [libdrm_dep, gst_dep, video_dep],
 )
 
 pkg_name = 'gstreamer-allocators-1.0'

@@ -20,7 +20,9 @@
 
 #pragma once
 
+#include <gst/gst.h>
 #include <gst/allocators/gstdmabuf.h>
+#include <gst/video/gstvideopool.h>
 
 G_BEGIN_DECLS
 
@@ -63,5 +65,20 @@ G_DECLARE_FINAL_TYPE (GstUdmabufAllocator, gst_udmabuf_allocator, GST, UDMABUF_A
 
 GST_ALLOCATORS_API
 void gst_udmabuf_allocator_init_once (void);
+
+/**
+ * GST_TYPE_UDMABUF_VIDEO_POOL:
+ *
+ * Macro that returns the #GstUdmabufVideoPool type.
+ *
+ * Since: 1.28
+ */
+#define GST_TYPE_UDMABUF_VIDEO_POOL gst_udmabuf_video_pool_get_type ()
+GST_ALLOCATORS_API
+G_DECLARE_FINAL_TYPE (GstUdmabufVideoPool, gst_udmabuf_video_pool, GST,
+    UDMABUF_VIDEO_POOL, GstVideoBufferPool)
+
+GST_ALLOCATORS_API
+GstBufferPool *gst_udmabuf_video_pool_new ();
 
 G_END_DECLS

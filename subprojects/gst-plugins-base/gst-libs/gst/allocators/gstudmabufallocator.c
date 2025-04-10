@@ -43,6 +43,7 @@
 
 #include "gstudmabufallocator.h"
 
+#include <linux/dma-buf.h>
 #include <sys/stat.h>
 
 #include "gst/gst_private.h"
@@ -72,6 +73,14 @@ G_DEFINE_TYPE_WITH_CODE (GstUdmabufAllocator, gst_udmabuf_allocator,
     GST_DEBUG_CATEGORY_INIT (gst_udmabuf_debug, "udmabufallocator", 0,
         "udmabuf allocator");
     );
+
+struct _GstUdmabufVideoPool
+{
+  GstVideoBufferPool parent;
+};
+
+G_DEFINE_TYPE (GstUdmabufVideoPool, gst_udmabuf_video_pool,
+    GST_TYPE_VIDEO_BUFFER_POOL);
 
 #define UDMABUF_CREATE        _IOW('u', 0x42, struct udmabuf_create)
 #define UDMABUF_FLAGS_CLOEXEC 0x01
@@ -298,4 +307,169 @@ gst_udmabuf_allocator_init_once (void)
     g_once_init_leave (&_init, 1);
   }
 #endif
+}
+
+typedef struct _DmaBufSource
+{
+  GSource base;
+
+  GstBufferPool *pool;
+  GstBuffer *buffer;
+
+  gint mem_fds[16 /* GST_BUFFER_MEM_MAX */ ];
+  gpointer fd_tags[16 /* GST_BUFFER_MEM_MAX */ ];
+} DmaBufSource;
+
+static gboolean
+dma_buf_fd_readable (gint fd)
+{
+  GPollFD poll_fd;
+
+  poll_fd.fd = fd;
+  poll_fd.events = G_IO_IN;
+  poll_fd.revents = 0;
+
+  if (!g_poll (&poll_fd, 1, 0))
+    return FALSE;
+
+  return (poll_fd.revents & (G_IO_IN | G_IO_NVAL)) != 0;
+}
+
+static int
+get_sync_file (gint fd)
+{
+  struct dma_buf_export_sync_file sync_file_in_out = {
+    .flags = DMA_BUF_SYNC_WRITE,
+    .fd = -1
+  };
+  gint ret;
+
+  do {
+    ret = ioctl (fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &sync_file_in_out);
+  } while (ret == -1 && errno == EINTR);
+
+  if (ret == 0)
+    return sync_file_in_out.fd;
+
+  return -1;
+}
+
+static gboolean
+dma_buf_source_dispatch (GSource * base,
+    GSourceFunc callback, gpointer user_data)
+{
+  DmaBufSource *source = (DmaBufSource *) base;
+  gboolean ready;
+
+  GST_DEBUG_OBJECT (source->pool, "Dispatch source for buffer %p",
+      source->buffer);
+
+  ready = TRUE;
+
+  for (gint i = 0; i < 16 /* GST_BUFFER_MEM_MAX */ ; i++) {
+    if (!source->fd_tags[i])
+      continue;
+
+    if (!dma_buf_fd_readable (source->mem_fds[i])) {
+      GST_DEBUG_OBJECT (source->pool, "Buffer %p not ready, sync file: %d",
+          source->buffer, source->mem_fds[i]);
+      ready = FALSE;
+      continue;
+    }
+
+    close (source->mem_fds[i]);
+    g_source_remove_unix_fd (base, source->fd_tags[i]);
+    source->fd_tags[i] = NULL;
+  }
+
+  if (!ready)
+    return G_SOURCE_CONTINUE;
+
+  GST_DEBUG_OBJECT (source->pool, "Releasing buffer %p from source, pool %p",
+      source->buffer, source->pool);
+  ((GstBufferPoolClass *)
+      gst_udmabuf_video_pool_parent_class)->release_buffer (source->pool,
+      source->buffer);
+  g_source_unref (base);
+
+  return G_SOURCE_REMOVE;
+}
+
+static GSourceFuncs dma_buf_source_funcs = {
+  .dispatch = dma_buf_source_dispatch
+};
+
+static void
+gst_udmabuf_video_pool_release_buffer (GstBufferPool * pool, GstBuffer * buffer)
+{
+  DmaBufSource *source = NULL;
+
+  GST_DEBUG_OBJECT (pool, "Buffer: %p", buffer);
+
+  for (gint i = 0; i < gst_buffer_n_memory (buffer); i++) {
+    GstMemory *mem;
+    gint mem_fd, sync_file;
+
+    mem = gst_buffer_peek_memory (buffer, i);
+    if (!gst_is_dmabuf_memory (mem))
+      continue;
+
+    mem_fd = gst_dmabuf_memory_get_fd (mem);
+    sync_file = get_sync_file (mem_fd);
+    if (sync_file == -1) {
+      GST_ERROR_OBJECT (pool, "Exporting sync file failed");
+      continue;
+    }
+
+    if (dma_buf_fd_readable (sync_file)) {
+      GST_DEBUG_OBJECT (pool, "Sync file readable");
+      close (sync_file);
+      continue;
+    }
+
+    if (!source) {
+      GST_DEBUG_OBJECT (pool, "Creating source for buffer %p, pool %p", buffer,
+          pool);
+      source =
+          (DmaBufSource *) g_source_new (&dma_buf_source_funcs,
+          sizeof (*source));
+      source->pool = pool;
+      source->buffer = buffer;
+    }
+
+    GST_DEBUG_OBJECT (pool, "Adding sync file to source");
+    source->mem_fds[i] = sync_file;
+    source->fd_tags[i] =
+        g_source_add_unix_fd (&source->base, sync_file, G_IO_IN);
+  }
+
+  if (source) {
+    g_source_attach ((GSource *) source, NULL);
+  } else {
+    ((GstBufferPoolClass *)
+        gst_udmabuf_video_pool_parent_class)->release_buffer (pool, buffer);
+  }
+}
+
+static void
+gst_udmabuf_video_pool_init (GstUdmabufVideoPool * self)
+{
+}
+
+static void
+gst_udmabuf_video_pool_class_init (GstUdmabufVideoPoolClass * klass)
+{
+  GstBufferPoolClass *pool_class = GST_BUFFER_POOL_CLASS (klass);
+
+  pool_class->release_buffer = gst_udmabuf_video_pool_release_buffer;
+}
+
+GstBufferPool *
+gst_udmabuf_video_pool_new ()
+{
+  GstUdmabufVideoPool *pool;
+
+  pool = g_object_new (GST_TYPE_UDMABUF_VIDEO_POOL, NULL);
+
+  return GST_BUFFER_POOL_CAST (pool);
 }
