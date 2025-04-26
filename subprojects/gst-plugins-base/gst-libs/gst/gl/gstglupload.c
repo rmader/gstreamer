@@ -456,6 +456,9 @@ _udmabuf_upload_transform_caps (gpointer impl, GstGLContext * context,
   if (!upload->allocator)
     return NULL;
 
+  GST_WARNING_OBJECT (upload->upload, "direction %s",
+      direction == GST_PAD_SRC ? "src" : "sink");
+
   if (direction == GST_PAD_SINK) {
     g_autoptr (GstCaps) static_caps;
     g_autoptr (GstCaps) intersected_caps;
@@ -644,8 +647,8 @@ _udmabuf_upload_transform_caps (gpointer impl, GstGLContext * context,
     gst_caps_features_free (features);
   }
 
-  GST_DEBUG_OBJECT (upload->upload, "direction %s, transformed %"
-      GST_PTR_FORMAT " into %" GST_PTR_FORMAT,
+  GST_DEBUG_OBJECT (upload->upload, "direction %s, transformed\n%"
+      GST_PTR_FORMAT "\ninto\n%" GST_PTR_FORMAT,
       direction == GST_PAD_SRC ? "src" : "sink", caps, out_caps);
 
   return out_caps;
@@ -669,11 +672,14 @@ _udmabuf_upload_accept (gpointer impl, GstBuffer * buffer,
       gst_caps_is_equal (upload->out_caps, out_caps))
     return TRUE;
 
+  g_clear_pointer (&upload->in_caps, gst_caps_unref);
+  g_clear_pointer (&upload->out_caps, gst_caps_unref);
+
   static_sink_caps = gst_static_caps_get (&_udmabuf_upload_sink_caps);
   common_in_caps = gst_caps_intersect_full (in_caps, static_sink_caps,
       GST_CAPS_INTERSECT_FIRST);
   if (gst_caps_is_empty (common_in_caps)) {
-    GST_DEBUG_OBJECT (upload->upload, "No common caps, direction sink");
+    GST_WARNING_OBJECT (upload->upload, "No common caps with upstream");
     return FALSE;
   }
 
@@ -681,12 +687,13 @@ _udmabuf_upload_accept (gpointer impl, GstBuffer * buffer,
   common_out_caps = gst_caps_intersect_full (out_caps, static_src_caps,
       GST_CAPS_INTERSECT_FIRST);
   if (gst_caps_is_empty (common_out_caps)) {
-    GST_DEBUG_OBJECT (upload->upload, "No common caps, direction sink");
+    GST_WARNING_OBJECT (upload->upload, "No common caps with downstream");
     return FALSE;
   }
 
-  GST_DEBUG_OBJECT (upload->upload, "New caps in: %" GST_PTR_FORMAT " out: %"
-      GST_PTR_FORMAT, in_caps, out_caps);
+  GST_WARNING_OBJECT (upload->upload,
+      "New caps\nin: %" GST_PTR_FORMAT "\nout: %" GST_PTR_FORMAT, in_caps,
+      out_caps);
 
   upload->in_caps = gst_caps_copy (in_caps);
   upload->out_caps = gst_caps_copy (out_caps);
@@ -712,9 +719,6 @@ _udmabuf_upload_propose_allocation (gpointer impl, GstQuery * decide_query,
   if (!upload->allocator)
     return;
 
-  if (upload->pool)
-    _udmabuf_reset (upload);
-
   gst_query_parse_allocation (query, &query_caps, &need_pool);
   if (!query_caps) {
     GST_WARNING_OBJECT (upload->upload, "Query contained invalid caps");
@@ -722,7 +726,7 @@ _udmabuf_upload_propose_allocation (gpointer impl, GstQuery * decide_query,
   }
 
   if (!need_pool) {
-    GST_DEBUG_OBJECT (upload->upload,
+    GST_WARNING_OBJECT (upload->upload,
         "Upstream element doesn't support downstream pools");
     return;
   }
@@ -731,8 +735,37 @@ _udmabuf_upload_propose_allocation (gpointer impl, GstQuery * decide_query,
   common_in_caps = gst_caps_intersect_full (query_caps, static_sink_caps,
       GST_CAPS_INTERSECT_FIRST);
   if (gst_caps_is_empty (common_in_caps)) {
-    GST_DEBUG_OBJECT (upload->upload, "Caps not supported");
+    GST_WARNING_OBJECT (upload->upload, "No common caps with upstream");
     return;
+  }
+
+  if (decide_query) {
+    g_autoptr (GstCaps) static_src_caps = NULL;
+    g_autoptr (GstCaps) common_out_caps = NULL;
+    g_autoptr (GstCaps) query_caps_decide = NULL;
+    gboolean need_pool_decide;
+
+    gst_query_parse_allocation (decide_query, &query_caps_decide,
+        &need_pool_decide);
+    if (!query_caps_decide) {
+      GST_WARNING_OBJECT (upload->upload,
+          "Decide-Query contained invalid caps");
+      return;
+    }
+
+    static_src_caps = gst_static_caps_get (&_udmabuf_upload_src_caps);
+    common_out_caps =
+        gst_caps_intersect_full (query_caps_decide, static_src_caps,
+        GST_CAPS_INTERSECT_FIRST);
+    if (gst_caps_is_empty (common_out_caps)) {
+      GST_WARNING_OBJECT (upload->upload, "No common caps with downstream");
+      return;
+    }
+
+    GST_WARNING_OBJECT (upload->upload,
+        "query_caps: %" GST_PTR_FORMAT " - need-pool: %d\n"
+        "query_caps_decide: %" GST_PTR_FORMAT " - need-pool: %d\n",
+        query_caps, need_pool, query_caps_decide, need_pool_decide);
   }
 
   if (!gst_video_info_from_caps (&info, query_caps)) {
@@ -742,12 +775,35 @@ _udmabuf_upload_propose_allocation (gpointer impl, GstQuery * decide_query,
 
   gst_query_add_allocation_param (query, upload->allocator, &params);
   gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, 0);
-
-  upload->pool = gst_udmabuf_video_pool_new ();
-  config = gst_buffer_pool_get_config (upload->pool);
-
-  gst_buffer_pool_config_set_allocator (config, upload->allocator, &params);
   size = GST_VIDEO_INFO_SIZE (&info);
+
+  {
+    gboolean found_pool = FALSE;
+
+    GST_WARNING_OBJECT (upload->upload,
+        "Current pool %p, checking %d pools on query", upload->pool,
+        gst_query_get_n_allocation_pools (query));
+
+    for (gint i = 0; i < gst_query_get_n_allocation_pools (query); i++) {
+      g_autoptr (GstBufferPool) pool = NULL;
+
+      gst_query_parse_nth_allocation_pool (query, i, &pool, NULL, NULL, NULL);
+      if (pool == upload->pool) {
+        GST_WARNING_OBJECT (upload->upload, "Found existing pool");
+        found_pool = TRUE;
+        break;
+      }
+    }
+    if (!found_pool) {
+      GST_WARNING_OBJECT (upload->upload, "Adding new pool");
+      g_clear_object (&upload->pool);
+      upload->pool = gst_udmabuf_video_pool_new ();
+      gst_query_add_allocation_pool (query, upload->pool, size, 0, 0);
+    }
+  }
+
+  config = gst_buffer_pool_get_config (upload->pool);
+  gst_buffer_pool_config_set_allocator (config, upload->allocator, &params);
   gst_buffer_pool_config_set_params (config, gst_caps_ref (query_caps), size, 0,
       0);
   gst_buffer_pool_config_add_option (config, GST_BUFFER_POOL_OPTION_VIDEO_META);
@@ -760,14 +816,14 @@ _udmabuf_upload_propose_allocation (gpointer impl, GstQuery * decide_query,
 
   if (!gst_buffer_pool_set_config (upload->pool, config)) {
     GST_WARNING_OBJECT (upload->upload, "Can't set pool config");
-    _udmabuf_reset (upload);
+    g_clear_object (&upload->pool);
+    // TODO: clear from query?
     return;
   }
 
-  gst_query_add_allocation_pool (query, upload->pool, size, 0, 0);
-
   GST_INFO_OBJECT (upload->upload,
-      "Proposed udmabuf pool for caps: %" GST_PTR_FORMAT, query_caps);
+      "Proposed udmabuf pool %p for caps: %" GST_PTR_FORMAT, upload->pool,
+      query_caps);
 }
 
 static GstGLUploadReturn
@@ -1527,6 +1583,10 @@ _dma_buf_upload_accept (gpointer impl, GstBuffer * buffer, GstCaps * in_caps,
   gsize offset[GST_VIDEO_MAX_PLANES];
   gint fd[GST_VIDEO_MAX_PLANES];
   guint i;
+
+  // TODO: fix AMD drivers?
+  if (dmabuf->target == GST_GL_TEXTURE_TARGET_EXTERNAL_OES)
+    return FALSE;
 
   n_mem = gst_buffer_n_memory (buffer);
   meta = gst_buffer_get_video_meta (buffer);
@@ -3844,14 +3904,22 @@ gst_gl_upload_fixate_caps (GstGLUpload * upload, GstPadDirection direction,
 
     /* If the target is found, fixate the other fields */
     if (i < n) {
+      GstCapsFeatures *features;
+
+      features = gst_caps_get_features (othercaps, i);
+
       ret_caps = gst_caps_new_empty ();
       gst_caps_append_structure_full (ret_caps,
           gst_structure_copy (gst_caps_get_structure (othercaps, i)),
-          gst_caps_features_copy (gst_caps_get_features (othercaps, i)));
+          gst_caps_features_copy (features));
 
       ret_caps = gst_caps_fixate (ret_caps);
-      gst_caps_set_simple (ret_caps, "texture-target", G_TYPE_STRING,
-          gst_gl_texture_target_to_string (target), NULL);
+
+      if (gst_caps_features_contains (features,
+              GST_CAPS_FEATURE_MEMORY_GL_MEMORY)) {
+        gst_caps_set_simple (ret_caps, "texture-target", G_TYPE_STRING,
+            gst_gl_texture_target_to_string (target), NULL);
+      }
 
       gst_caps_unref (othercaps);
 
